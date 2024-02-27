@@ -1,0 +1,256 @@
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+    Default: xxxxxxx # add key name
+
+
+Resources:
+# Create A Web Security Group
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP, SSH and HTTPS access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      VpcId: !ImportValue Networking-VpcId 
+
+# Create A app Security Group With HTTP And SSH Access
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP and SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: xxxxxxx # add your IP address
+      VpcId: !ImportValue Networking-VpcId 
+
+# Create A Database Security Group
+  DataBaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable MySQL access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+      VpcId: !ImportValue Networking-VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+
+# Create A Primary Database
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: 20
+      PubliclyAccessible: 'false'
+      DBInstanceClass: db.t2.micro
+      DBInstanceIdentifier: Database
+      Engine: MySQL
+      MasterUsername: xxxxx # add user name
+      MasterUserPassword: xxxxxxx # add password
+      DBSubnetGroupName: !ImportValue Networking-DatabaseSubnetGroup
+      AvailabilityZone: us-east-1a
+      VPCSecurityGroups:
+        - !Ref DataBaseSecurityGroup
+
+  # Create A Read Replica Database
+
+  ReadReplicaInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t2.micro
+      SourceDBInstanceIdentifier: !Ref Database
+
+
+# Create A Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !ImportValue Networking-PublicSubnet1
+        - !ImportValue Networking-PublicSubnet2
+      SecurityGroups:
+        - !Ref WebSecurityGroup
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Tags:
+        - Key: Name
+          Value: LoadBalancer
+
+
+
+# Create A Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: !ImportValue Networking-VpcId 
+
+# Create A Listener
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+# Create A Launch Template
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: xxxxxxxxx # add ami
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        UserData: !Base64 |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "Hello World" > /var/www/html/index.html
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: AppServer
+      LaunchTemplateName: AppServerLaunchTemplate
+
+
+# Create A Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: AppServerAutoScalingGroup
+      DesiredCapacity: 2
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MaxSize: 4
+      MinSize: 2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      VPCZoneIdentifier:
+        - !ImportValue Networking-PrivateSubnet1 
+        - !ImportValue Networking-PrivateSubnet2 
+
+
+# Create A Scaling Policy
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1  
+
+# Cpu Alarm High
+  CpuAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 40% for 10 minutes
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Period: 300
+      Statistic: Average
+      Threshold: 40
+      AlarmActions:
+        - !Ref WebServerScalingUpPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+
+# Cpu Alarm Low
+  CpuAlarmLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 40% for 10 minutes
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 2
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Period: 300
+      Statistic: Average
+      Threshold: 40
+      AlarmActions:
+        - !Ref WebServerScalingDownPolicy
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+
+# Web Server Scalind Up Policy
+  WebServerScalingUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: 1
+
+# Web Server Scalind Down Policy
+  WebServerScalingDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: 300
+      ScalingAdjustment: -1
+
+
+Outputs:
+  LoadBalancerDNS:
+    Description: The DNS of the Load Balancer
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: Web-App-DNS
+  DatabaseDNS:
+    Description: The DNS of the Database
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: Web-App-Database-DNS
+  DatabaseSecurityGroup:
+    Description: The Database Security Group
+    Value: !Ref DataBaseSecurityGroup
+    Export:
+      Name: Web-App-Database-SecurityGroup
+  AppSecurityGroup:
+    Description: The App Security Group
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: Web-App-AppSecurityGroup
